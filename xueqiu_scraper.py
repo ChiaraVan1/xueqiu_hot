@@ -281,14 +281,25 @@ def scrape_and_save(debug: bool = False):
     print("[3/3] 补充行业信息...")
     enrich_industry(session, all_rows, debug=debug)
 
-    # Step 4: 写 CSV
+    # Step 4a: 每日独立文件（便于单日查看/备份）
     outfile = OUTPUT_DIR / f"xueqiu_hot_{today}.csv"
     with open(outfile, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
 
-    print(f"\n✅ 完成！共 {len(all_rows)} 条记录 → {outfile}")
+    # Step 4b: 追加写入 master 文件（便于跨日分析霸榜/趋势）
+    master = OUTPUT_DIR / "xueqiu_hot_master.csv"
+    write_header = not master.exists()
+    with open(master, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"\n✅ 完成！共 {len(all_rows)} 条记录")
+    print(f"   每日文件 → {outfile}")
+    print(f"   历史汇总 → {master}")
     _print_preview(all_rows[:5])
 
 
