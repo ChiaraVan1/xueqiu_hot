@@ -5,37 +5,36 @@
 策略：从环境变量 XUEQIU_TOKEN 读取 xq_a_token Cookie
       → requests 调用雪球内部 API
       → 逐个查询 quote 接口补充成交额/市值/换手率
+      → 调用 Claude API 批量判断行业
       → 结果写入带日期的 CSV + 追加至 master.csv
 
 实测 API 结构（2026-06-24）：
-  热榜 API：返回顺序即排名，字段有 rank_change（排名变化）
+  热榜 API：返回顺序即排名，rank_change = 排名位次变化
             无 amount/market_capital/turnover_rate，需 quote API 补充
-  Quote API：单股查询返回 data.quote，批量查询返回全 null（不支持）
-             行业字段不存在于 quote 对象，暂留空
-
-Token 获取（一次性操作）：
-  浏览器登录 xueqiu.com → F12 → Application → Cookies
-  → 复制 xq_a_token 的值 → 存入 GitHub Secret: XUEQIU_TOKEN
+  Quote API：批量查询返回全 null，必须单股逐个查
+             行业/关注人数字段不存在，由 Claude 补充
+  Claude：七牛云代理，一次调用批量判断所有股票行业
 
 用法：
-  XUEQIU_TOKEN=xxx python xueqiu_scraper.py
-  python xueqiu_scraper.py --debug   # 打印原始字段
+  XUEQIU_TOKEN=xxx CLAUDE_API_KEY=xxx python xueqiu_scraper.py
+  python xueqiu_scraper.py --debug
 =====================================================
 """
 
 import argparse
 import csv
+import json
 import os
 import time
 import schedule
 import requests
 from datetime import datetime
 from pathlib import Path
+from openai import OpenAI
 
 # ─────────────────────────── 配置 ───────────────────────────
 OUTPUT_DIR = Path("xueqiu_data")
 
-# 四个榜单对应的 type 参数
 MARKET_TYPES = {
     "全球": 10,
     "沪深": 12,
@@ -46,8 +45,7 @@ MARKET_TYPES = {
 HOT_LIST_API = "https://stock.xueqiu.com/v5/stock/hot_stock/list.json"
 QUOTE_API    = "https://stock.xueqiu.com/v5/stock/quote.json"
 
-# 每个榜单取前 N 名（API 返回顺序即排名）
-TOP_N = 9
+TOP_N = 9  # 每个榜单取前 N 名（API 返回顺序即排名）
 
 HEADERS = {
     "User-Agent": (
@@ -61,13 +59,11 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-# CSV 列顺序（行业和关注人数 quote API 不返回，保留列但留空）
 CSV_FIELDS = [
     "日期", "榜单", "排名", "排名变化",
     "股票代码", "股票名称", "行业",
     "当前价格", "涨跌幅(%)", "涨跌额",
     "成交额(亿)", "总市值(亿)", "换手率(%)",
-    "雪球关注人数",
 ]
 
 # ─────────────────────────── Cookie 获取 ───────────────────────────
@@ -75,10 +71,10 @@ CSV_FIELDS = [
 def get_xueqiu_cookies() -> dict:
     token = os.environ.get("XUEQIU_TOKEN", "").strip()
     if token:
-        print(f"[1/3] 使用环境变量 Token（前8位）: {token[:8]}...")
+        print(f"[1/4] 使用环境变量 Token（前8位）: {token[:8]}...")
         return {"xq_a_token": token, "xqat": token}
 
-    print("[1/3] 未检测到 XUEQIU_TOKEN，尝试用 Playwright 获取（仅限本地）...")
+    print("[1/4] 未检测到 XUEQIU_TOKEN，尝试用 Playwright 获取（仅限本地）...")
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -121,9 +117,8 @@ def fetch_hot_list(session: requests.Session, market_name: str, type_id: int,
                    debug: bool = False) -> list[dict]:
     """
     获取单个榜单数据。
-    实测：API 返回顺序即排名（第1条=第1名），只取前 TOP_N 条。
-    rank_change 字段 = 排名变化（正=上升，负=下降，0=不变）。
-    成交额/市值/换手率/关注人数 热榜 API 不返回，后续由 quote API 补充。
+    实测：API 返回顺序即排名，rank_change = 排名位次变化（正=上升，负=下降）。
+    成交额/市值/换手率 热榜 API 不返回，由 enrich_quote 补充。
     """
     params = {"size": 30, "_type": 10, "type": type_id}
     resp = session.get(HOT_LIST_API, params=params, timeout=15)
@@ -137,22 +132,20 @@ def fetch_hot_list(session: requests.Session, market_name: str, type_id: int,
             print(f"   {k}: {v!r}")
         print()
 
-    # 返回顺序即排名，取前 TOP_N
     result = []
     for rank, item in enumerate(items[:TOP_N], start=1):
         result.append({
-            "排名":        rank,
-            "排名变化":    item.get("rank_change", 0),  # 正=上升 负=下降
-            "股票代码":    item.get("symbol", ""),
-            "股票名称":    item.get("name", ""),
-            "行业":        "",   # quote API 无此字段，留空
-            "当前价格":    item.get("current", ""),
-            "涨跌幅(%)":   item.get("percent", ""),
-            "涨跌额":      item.get("chg", ""),
-            "成交额(亿)":  "",   # 由 enrich_quote 补充
-            "总市值(亿)":  "",   # 由 enrich_quote 补充
-            "换手率(%)":   "",   # 由 enrich_quote 补充
-            "雪球关注人数": "",  # quote API 无此字段，留空
+            "排名":       rank,
+            "排名变化":   item.get("rank_change", 0),
+            "股票代码":   item.get("symbol", ""),
+            "股票名称":   item.get("name", ""),
+            "行业":       "",   # 由 enrich_industry_ai 补充
+            "当前价格":   item.get("current", ""),
+            "涨跌幅(%)":  item.get("percent", ""),
+            "涨跌额":     item.get("chg", ""),
+            "成交额(亿)": "",   # 由 enrich_quote 补充
+            "总市值(亿)": "",   # 由 enrich_quote 补充
+            "换手率(%)":  "",   # 由 enrich_quote 补充
         })
 
     return result
@@ -164,8 +157,7 @@ def enrich_quote(session: requests.Session, rows: list[dict],
                  debug: bool = False) -> None:
     """
     逐个查询 quote 接口，补充成交额、总市值、换手率。
-    实测：批量查询（多个 symbol 逗号分隔）返回全 null，必须单股查询。
-    行业和关注人数 quote 对象不包含，无法补充。
+    实测：批量查询返回全 null，只能单股查询。
     """
     for i, row in enumerate(rows):
         sym = row["股票代码"]
@@ -179,9 +171,9 @@ def enrich_quote(session: requests.Session, rows: list[dict],
             q = resp.json().get("data", {}).get("quote") or {}
 
             if debug and i == 0:
-                print(f"\n[DEBUG] Quote API({sym}) 完整字段：")
-                for k, v in sorted(q.items()):
-                    print(f"   {k}: {v!r}")
+                print(f"\n[DEBUG] Quote API({sym}) 关键字段：")
+                for k in ["amount", "market_capital", "turnover_rate"]:
+                    print(f"   {k}: {q.get(k)!r}")
                 print()
 
             amt = q.get("amount") or 0
@@ -195,7 +187,79 @@ def enrich_quote(session: requests.Session, rows: list[dict],
         except Exception as e:
             print(f"   ⚠ quote 查询失败 {sym}: {e}")
 
-        time.sleep(0.3)   # 避免触发频率限制
+        time.sleep(0.3)
+
+
+# ─────────────────────────── AI 行业判断 ───────────────────────────
+
+def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
+    """
+    一次 Claude API 调用，批量判断所有股票的行业。
+    使用七牛云代理接口（与 stock_Valuation_bot 同一套）。
+    Claude 对主流 A股/港股/美股 行业归属准确率很高；
+    不确定时返回"其他"而非瞎猜。
+    """
+    api_key = os.environ.get("CLAUDE_API_KEY", "").strip()
+    if not api_key:
+        print("   ⚠ CLAUDE_API_KEY 未设置，跳过行业判断")
+        return
+
+    # 去重，避免重复查同一只股票
+    seen: dict[str, str] = {}  # symbol -> industry
+    unique = []
+    for row in rows:
+        sym = row["股票代码"]
+        if sym and sym not in seen:
+            seen[sym] = ""
+            unique.append({"symbol": sym, "name": row["股票名称"]})
+
+    if not unique:
+        return
+
+    stock_list = "\n".join(f'{s["symbol"]} {s["name"]}' for s in unique)
+    prompt = f"""以下是一组股票代码和名称，请判断每只股票所属的行业（使用中文，简洁精准，如：半导体、白酒、新能源汽车、互联网、医药、银行、消费电子、石油、航运等）。
+
+股票列表：
+{stock_list}
+
+要求：
+1. 严格按 JSON 格式返回，key 为股票代码，value 为行业名称
+2. 不确定的返回"其他"
+3. 只返回 JSON，不要任何解释
+
+示例格式：
+{{"SH603986": "半导体", "SZ000858": "白酒"}}"""
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://openai.qiniu.com/v1"
+        )
+        resp = client.chat.completions.create(
+            model="claude-4.5-sonnet",
+            max_tokens=500,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        if debug:
+            print(f"\n[DEBUG] Claude 行业判断原始返回：\n{raw}\n")
+
+        # 清理可能的 markdown 代码块
+        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        industry_map: dict[str, str] = json.loads(raw)
+
+        # 写回
+        for row in rows:
+            sym = row["股票代码"]
+            if sym in industry_map:
+                row["行业"] = industry_map[sym]
+
+        print(f"   → Claude 行业判断完成（{len(industry_map)} 只股票）")
+
+    except Exception as e:
+        print(f"   ⚠ Claude 行业判断失败: {e}")
 
 
 # ─────────────────────────── 主流程 ───────────────────────────
@@ -214,7 +278,7 @@ def scrape_and_save(debug: bool = False):
     session.headers.update(HEADERS)
     session.cookies.update(cookies)
 
-    print(f"[2/3] 抓取四个榜单（每榜取前 {TOP_N} 名）...")
+    print(f"[2/4] 抓取四个榜单（每榜取前 {TOP_N} 名）...")
     all_rows: list[dict] = []
     first = True
 
@@ -235,8 +299,11 @@ def scrape_and_save(debug: bool = False):
         print("❌ 未抓到任何数据，请检查网络或 Cookie")
         return
 
-    print(f"[3/3] 逐股查询 quote 补充成交额/市值/换手率（共 {len(all_rows)} 条）...")
+    print(f"[3/4] 逐股查询 quote 补充成交额/市值/换手率（共 {len(all_rows)} 条）...")
     enrich_quote(session, all_rows, debug=debug)
+
+    print("[4/4] Claude 批量判断行业...")
+    enrich_industry_ai(all_rows, debug=debug)
 
     outfile = OUTPUT_DIR / f"xueqiu_hot_{today}.csv"
     with open(outfile, "w", newline="", encoding="utf-8-sig") as f:
@@ -264,8 +331,8 @@ def _print_preview(rows: list[dict]):
         print(
             f"  [{r['榜单']}] #{r['排名']}(变化:{r['排名变化']:+d}) "
             f"{r['股票名称']}({r['股票代码']})  "
-            f"涨跌幅={r['涨跌幅(%)']}%  "
-            f"成交额={r['成交额(亿)']}亿  换手率={r['换手率(%)']}%"
+            f"涨跌幅={r['涨跌幅(%)']}%  行业={r['行业'] or '—'}  "
+            f"成交额={r['成交额(亿)']}亿"
         )
 
 
