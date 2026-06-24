@@ -27,8 +27,8 @@ jobs:
       - name: 运行抓取脚本
         env:
           XUEQIU_TOKEN: ${{ secrets.XUEQIU_TOKEN }}
-        run: python xueqiu_scraper.py --debug
-        # 确认字段名正确后改为：python xueqiu_scraper.py
+          CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+        run: python xueqiu_scraper.py
 
       - name: Commit & Push CSV
         run: |
