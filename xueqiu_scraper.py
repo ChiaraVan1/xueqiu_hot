@@ -2,33 +2,29 @@
 """
 雪球热股榜 每日抓取脚本
 =====================================================
-策略：Playwright 访问首页取得合法 Cookie
-      → requests 调用雪球内部 API（更稳定、有结构化字段）
+策略：从环境变量 XUEQIU_TOKEN 读取 xq_a_token Cookie
+      → requests 调用雪球内部 API
       → 批量查询股票详情补充行业信息
-      → 结果写入带日期的 CSV
+      → 结果写入带日期的 CSV + 追加至 master.csv
 
-采集字段（对投资方向判断最有价值的维度）
-  日期 / 榜单 / 排名 / 排名变化
-  股票代码 / 股票名称 / 行业
-  当前价格 / 涨跌幅 / 涨跌额
-  成交额(亿) / 总市值(亿) / 换手率(%)
-  雪球关注人数   ← 散户情绪领先指标，是雪球特有优势数据
+Token 获取（一次性操作）：
+  浏览器登录 xueqiu.com → F12 → Application → Cookies
+  → 复制 xq_a_token 的值 → 存入 GitHub Secret: XUEQIU_TOKEN
 
 用法：
-  python xueqiu_scraper.py          # 立即运行一次
-  python xueqiu_scraper.py --daemon  # 每天定时运行（见文末说明）
+  XUEQIU_TOKEN=xxx python xueqiu_scraper.py
+  python xueqiu_scraper.py --debug   # 打印原始字段，用于排查空值
 =====================================================
 """
 
 import argparse
 import csv
-import json
+import os
 import time
 import schedule
 import requests
 from datetime import datetime
 from pathlib import Path
-from playwright.sync_api import sync_playwright
 
 # ─────────────────────────── 配置 ───────────────────────────
 OUTPUT_DIR = Path("xueqiu_data")
@@ -70,56 +66,27 @@ CSV_FIELDS = [
 # ─────────────────────────── Cookie 获取 ───────────────────────────
 
 def get_xueqiu_cookies() -> dict:
-    """用 Playwright 访问首页，拿到 xq_a_token 等必要 Cookie"""
-    print("[1/3] 启动浏览器获取 Cookie...")
-
-    stealth_js = """
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
-        window.chrome = {runtime: {}};
     """
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ],
+    访问雪球首页，从响应 Cookie 中自动获取 xq_a_token。
+    雪球对所有访客（不含登录）都会下发这个 token，每次运行拿新的，不存在过期问题。
+    如果请求被 block（GitHub Actions IP 被封），脚本会报错提示。
+    """
+    print("[1/3] 获取雪球访客 Token...")
+    try:
+        resp = requests.get(
+            "https://xueqiu.com",
+            headers=HEADERS,
+            timeout=15,
+            allow_redirects=True,
         )
-        ctx = browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            user_agent=HEADERS["User-Agent"],
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-        )
-        ctx.add_init_script(stealth_js)
-
-        page = ctx.new_page()
-
-        # 先访问首页预热
-        page.goto("https://xueqiu.com", wait_until="networkidle", timeout=30_000)
-        page.wait_for_timeout(2_500)
-
-        # 再访问热股榜页，确保取到相关 token
-        page.goto("https://xueqiu.com/hq#hot", wait_until="networkidle", timeout=30_000)
-        page.wait_for_timeout(2_000)
-
-        # 关掉可能弹出的登录框
-        for sel in ["[class*='modal'] [class*='close']", "[aria-label='关闭']", ".icon-close"]:
-            try:
-                page.locator(sel).first.click(timeout=1_500)
-            except Exception:
-                pass
-
-        raw_cookies = ctx.cookies()
-        browser.close()
-
-    cookies = {c["name"]: c["value"] for c in raw_cookies}
-    print(f"   → 获取到 {len(cookies)} 个 Cookie")
-    return cookies
+        cookies = dict(resp.cookies)
+        token = cookies.get("xq_a_token", "")
+        if not token:
+            raise RuntimeError("响应中未找到 xq_a_token，雪球可能封锁了当前 IP")
+        print(f"   → Token 获取成功（前8位）: {token[:8]}...")
+        return cookies
+    except requests.exceptions.Timeout:
+        raise RuntimeError("访问 xueqiu.com 超时，当前网络环境可能被封锁")
 
 
 # ─────────────────────────── 热榜抓取 ───────────────────────────
