@@ -67,26 +67,56 @@ CSV_FIELDS = [
 
 def get_xueqiu_cookies() -> dict:
     """
-    访问雪球首页，从响应 Cookie 中自动获取 xq_a_token。
-    雪球对所有访客（不含登录）都会下发这个 token，每次运行拿新的，不存在过期问题。
-    如果请求被 block（GitHub Actions IP 被封），脚本会报错提示。
+    优先从环境变量 XUEQIU_TOKEN 读取 token（GitHub Actions 场景）。
+    本地运行时可不设置环境变量，脚本会用 Playwright 自动获取。
+
+    token 获取方式（一次性）：
+      浏览器登录 xueqiu.com → F12 → Application → Cookies → 复制 xq_a_token
+      → 存入 GitHub Secret: XUEQIU_TOKEN
+    token 过期：GitHub Actions 失败时会发邮件通知，重新复制一次即可。
     """
-    print("[1/3] 获取雪球访客 Token...")
+    token = os.environ.get("XUEQIU_TOKEN", "").strip()
+
+    if token:
+        print(f"[1/3] 使用环境变量 Token（前8位）: {token[:8]}...")
+        return {"xq_a_token": token, "xqat": token}
+
+    # 本地运行 fallback：用 Playwright 自动获取
+    print("[1/3] 未检测到 XUEQIU_TOKEN，尝试用 Playwright 获取（仅限本地）...")
     try:
-        resp = requests.get(
-            "https://xueqiu.com",
-            headers=HEADERS,
-            timeout=15,
-            allow_redirects=True,
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise RuntimeError(
+            "本地运行需要安装 Playwright：pip install playwright && playwright install chromium\n"
+            "或设置环境变量 XUEQIU_TOKEN"
         )
-        cookies = dict(resp.cookies)
-        token = cookies.get("xq_a_token", "")
-        if not token:
-            raise RuntimeError("响应中未找到 xq_a_token，雪球可能封锁了当前 IP")
-        print(f"   → Token 获取成功（前8位）: {token[:8]}...")
-        return cookies
-    except requests.exceptions.Timeout:
-        raise RuntimeError("访问 xueqiu.com 超时，当前网络环境可能被封锁")
+
+    stealth_js = """
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
+        window.chrome = {runtime: {}};
+    """
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = browser.new_context(
+            user_agent=HEADERS["User-Agent"], locale="zh-CN", timezone_id="Asia/Shanghai"
+        )
+        ctx.add_init_script(stealth_js)
+        page = ctx.new_page()
+        page.goto("https://xueqiu.com", wait_until="networkidle", timeout=30_000)
+        page.wait_for_timeout(2_000)
+        raw = ctx.cookies()
+        browser.close()
+
+    cookies = {c["name"]: c["value"] for c in raw}
+    if not cookies.get("xq_a_token"):
+        raise RuntimeError("Playwright 未能获取 xq_a_token，请手动设置 XUEQIU_TOKEN")
+    print(f"   → Playwright Token 获取成功")
+    return cookies
 
 
 # ─────────────────────────── 热榜抓取 ───────────────────────────
