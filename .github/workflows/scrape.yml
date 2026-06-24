@@ -1,19 +1,15 @@
 name: 雪球热股榜每日抓取
 
 on:
-  # 每天北京时间 15:10（A股收盘后）自动运行
-  # UTC+8 → UTC：15:10 = 07:10
   schedule:
-    - cron: "10 7 * * 1-5"   # 周一至周五
-
-  # 随时手动触发（Actions 页面点 Run workflow）
+    - cron: "10 7 * * 1-5"   # 北京时间 15:10，周一至周五
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # 允许 commit & push CSV
+      contents: write
 
     steps:
       - name: Checkout 仓库
@@ -25,22 +21,16 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: 安装 Python 依赖
+      - name: 安装依赖
         run: pip install -r requirements.txt
 
-      - name: 安装 Playwright Chromium（含系统依赖）
-        run: playwright install --with-deps chromium
-
       - name: 运行抓取脚本
-        run: python xueqiu_scraper.py
-        # 如需调试字段，改为：
-        # run: python xueqiu_scraper.py --debug
+        run: python xueqiu_scraper.py --debug
 
       - name: Commit & Push CSV
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add xueqiu_data/
-          # 如果没有新文件则跳过（避免空 commit 报错）
           git diff --cached --quiet && echo "无新数据，跳过 commit" || \
             git commit -m "data: 热股榜 $(date -u +%Y-%m-%d)" && git push
