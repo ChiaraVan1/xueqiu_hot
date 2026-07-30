@@ -25,6 +25,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time
 import schedule
 import requests
@@ -296,8 +297,8 @@ def scrape_and_save(debug: bool = False):
         time.sleep(0.6)
 
     if not all_rows:
-        print("❌ 未抓到任何数据，请检查网络或 Cookie")
-        return
+        print("❌ 未抓到任何数据，Token 可能已过期，请更新 XUEQIU_TOKEN")
+        sys.exit(1)
 
     print(f"[3/4] 逐股查询 quote 补充成交额/市值/换手率（共 {len(all_rows)} 条）...")
     enrich_quote(session, all_rows, debug=debug)
