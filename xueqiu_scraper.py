@@ -70,46 +70,61 @@ CSV_FIELDS = [
 # ─────────────────────────── Cookie 获取 ───────────────────────────
 
 def get_xueqiu_cookies() -> dict:
+    """
+    优先用 Playwright 自动获取最新 xq_a_token（无需登录）。
+    若 Playwright 失败，再回退到环境变量 XUEQIU_TOKEN。
+    """
+    # 1) 优先 Playwright 自动获取（GitHub Actions / 本地都可用）
+    try:
+        from playwright.sync_api import sync_playwright
+        print("[1/4] 使用 Playwright 自动获取 xq_a_token...")
+
+        stealth_js = """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
+            window.chrome = {runtime: {}};
+        """
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ],
+            )
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+            ctx.add_init_script(stealth_js)
+            page = ctx.new_page()
+            page.goto("https://xueqiu.com", wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(3000)  # 给 JS 挑战一点时间
+            raw = ctx.cookies()
+            browser.close()
+
+        cookies = {c["name"]: c["value"] for c in raw}
+        token = cookies.get("xq_a_token")
+        if token:
+            print(f"   → Playwright Token 获取成功（前8位）: {token[:8]}...")
+            return cookies
+        print("   ⚠ Playwright 未拿到 xq_a_token，尝试环境变量...")
+    except Exception as e:
+        print(f"   ⚠ Playwright 获取失败: {e}，尝试环境变量...")
+
+    # 2) 回退到手动配置的 Token
     token = os.environ.get("XUEQIU_TOKEN", "").strip()
     if token:
         print(f"[1/4] 使用环境变量 Token（前8位）: {token[:8]}...")
         return {"xq_a_token": token, "xqat": token}
 
-    print("[1/4] 未检测到 XUEQIU_TOKEN，尝试用 Playwright 获取（仅限本地）...")
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        raise RuntimeError(
-            "本地运行需要安装 Playwright：pip install playwright && playwright install chromium\n"
-            "或设置环境变量 XUEQIU_TOKEN"
-        )
-
-    stealth_js = """
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});
-        window.chrome = {runtime: {}};
-    """
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        ctx = browser.new_context(
-            user_agent=HEADERS["User-Agent"], locale="zh-CN", timezone_id="Asia/Shanghai"
-        )
-        ctx.add_init_script(stealth_js)
-        page = ctx.new_page()
-        page.goto("https://xueqiu.com", wait_until="networkidle", timeout=30_000)
-        page.wait_for_timeout(2_000)
-        raw = ctx.cookies()
-        browser.close()
-
-    cookies = {c["name"]: c["value"] for c in raw}
-    if not cookies.get("xq_a_token"):
-        raise RuntimeError("Playwright 未能获取 xq_a_token，请手动设置 XUEQIU_TOKEN")
-    print("   → Playwright Token 获取成功")
-    return cookies
+    raise RuntimeError(
+        "无法获取 xq_a_token。\n"
+        "请确保已安装 Playwright 浏览器，或设置环境变量 XUEQIU_TOKEN"
+    )
 
 
 # ─────────────────────────── 热榜抓取 ───────────────────────────
