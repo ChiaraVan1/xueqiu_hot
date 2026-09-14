@@ -24,8 +24,12 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
+      - name: 安装 Playwright Chromium（自动获取 Token）
+        run: python -m playwright install --with-deps chromium
+
       - name: 运行抓取脚本
         env:
+          # 可选：保留作为 fallback；优先用 Playwright 自动获取
           XUEQIU_TOKEN: ${{ secrets.XUEQIU_TOKEN }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
         run: python xueqiu_scraper.py
