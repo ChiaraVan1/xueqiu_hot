@@ -5,18 +5,22 @@
 策略：从环境变量 XUEQIU_TOKEN 读取 xq_a_token Cookie
       → requests 调用雪球内部 API
       → 逐个查询 quote 接口补充成交额/市值/换手率
-      → 调用 Claude API 批量判断行业
+      → 调用 LLM（阿里云 DashScope）批量判断行业
       → 结果写入带日期的 CSV + 追加至 master.csv
 
 实测 API 结构（2026-06-24）：
   热榜 API：返回顺序即排名，rank_change = 排名位次变化
             无 amount/market_capital/turnover_rate，需 quote API 补充
   Quote API：批量查询返回全 null，必须单股逐个查
-             行业/关注人数字段不存在，由 Claude 补充
-  Claude：七牛云代理，一次调用批量判断所有股票行业
+             行业/关注人数字段不存在，由 LLM 补充
+  LLM：阿里云 DashScope（OpenAI 兼容接口），一次调用批量判断所有股票行业
+
+【2026-10-08 迁移说明】七牛云已收费，行业判断改走 DashScope：
+  key 由 CLAUDE_API_KEY 改为 ALIYUN_API_KEY；模型默认 deepseek-v4-pro，
+  可用环境变量 LLM_MODEL 覆盖（如 qwen-plus）。
 
 用法：
-  XUEQIU_TOKEN=xxx CLAUDE_API_KEY=xxx python xueqiu_scraper.py
+  XUEQIU_TOKEN=xxx ALIYUN_API_KEY=xxx python xueqiu_scraper.py
   python xueqiu_scraper.py --debug
 =====================================================
 """
@@ -45,6 +49,9 @@ MARKET_TYPES = {
 
 HOT_LIST_API = "https://stock.xueqiu.com/v5/stock/hot_stock/list.json"
 QUOTE_API    = "https://stock.xueqiu.com/v5/stock/quote.json"
+
+DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_LLM_MODEL  = "deepseek-v4-pro"
 
 TOP_N = 9  # 每个榜单取前 N 名（API 返回顺序即排名）
 
@@ -210,14 +217,14 @@ def enrich_quote(session: requests.Session, rows: list[dict],
 
 def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
     """
-    一次 Claude API 调用，批量判断所有股票的行业。
-    使用七牛云代理接口（与 stock_Valuation_bot 同一套）。
-    Claude 对主流 A股/港股/美股 行业归属准确率很高；
-    不确定时返回"其他"而非瞎猜。
+    一次 LLM 调用（阿里云 DashScope，OpenAI 兼容接口），批量判断所有股票的行业。
+    对主流 A股/港股/美股 行业归属准确率较高；不确定时返回"其他"而非瞎猜。
+    行业字段是 ERP 项目 popularity_signal.py 的输入，失败时行业列为空，
+    下游人气信号会降级为「数据不足」。
     """
-    api_key = os.environ.get("CLAUDE_API_KEY", "").strip()
+    api_key = os.environ.get("ALIYUN_API_KEY", "").strip()
     if not api_key:
-        print("   ⚠ CLAUDE_API_KEY 未设置，跳过行业判断")
+        print("   ⚠ ALIYUN_API_KEY 未设置，跳过行业判断")
         return
 
     # 去重，避免重复查同一只股票
@@ -249,21 +256,22 @@ def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
     try:
         client = OpenAI(
             api_key=api_key,
-            base_url="https://openai.qiniu.com/v1"
+            base_url=DASHSCOPE_BASE_URL,
         )
         resp = client.chat.completions.create(
-            model="claude-4.5-sonnet",
+            model=os.environ.get("LLM_MODEL", DEFAULT_LLM_MODEL),
             max_tokens=500,
             temperature=0,
+            extra_body={"enable_thinking": False},
             messages=[{"role": "user", "content": prompt}]
         )
         raw = resp.choices[0].message.content.strip()
 
         if debug:
-            print(f"\n[DEBUG] Claude 行业判断原始返回：\n{raw}\n")
+            print(f"\n[DEBUG] LLM 行业判断原始返回：\n{raw}\n")
 
         # 清理可能的 markdown 代码块
-        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         industry_map: dict[str, str] = json.loads(raw)
 
         # 写回
@@ -272,10 +280,10 @@ def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
             if sym in industry_map:
                 row["行业"] = industry_map[sym]
 
-        print(f"   → Claude 行业判断完成（{len(industry_map)} 只股票）")
+        print(f"   → LLM 行业判断完成（{len(industry_map)} 只股票）")
 
     except Exception as e:
-        print(f"   ⚠ Claude 行业判断失败: {e}")
+        print(f"   ⚠ LLM 行业判断失败: {e}")
 
 
 # ─────────────────────────── 主流程 ───────────────────────────
@@ -318,7 +326,7 @@ def scrape_and_save(debug: bool = False):
     print(f"[3/4] 逐股查询 quote 补充成交额/市值/换手率（共 {len(all_rows)} 条）...")
     enrich_quote(session, all_rows, debug=debug)
 
-    print("[4/4] Claude 批量判断行业...")
+    print("[4/4] AI 批量判断行业...")
     enrich_industry_ai(all_rows, debug=debug)
 
     outfile = OUTPUT_DIR / f"xueqiu_hot_{today}.csv"
