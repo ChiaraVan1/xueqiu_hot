@@ -63,6 +63,8 @@ CSV_FIELDS = [
     "当前价格", "涨跌幅(%)", "涨跌额",
     "成交额(亿)", "总市值(亿)", "换手率(%)",
 ]
+# 行业映射表：代码->行业 持久化缓存，命中后直接查表、不再重复调 LLM
+INDUSTRY_MAP_FILE = OUTPUT_DIR / "industry_map.json"
 
 # ─────────────────────────── Cookie 获取 ───────────────────────────
 def get_xueqiu_cookies() -> dict:
@@ -184,26 +186,62 @@ def enrich_quote(session: requests.Session, rows: list[dict],
             print(f"   ⚠ quote 查询失败 {sym}: {e}")
         time.sleep(0.3)
 
-# ─────────────────────────── AI 行业判断 ───────────────────────────
+# ─────────────────────────── 行业映射表（持久化） ───────────────────────────
+def load_industry_map() -> dict[str, str]:
+    """读取已固化的 代码->行业 映射，文件不存在或损坏时返回空表。"""
+    if INDUSTRY_MAP_FILE.exists():
+        try:
+            return json.loads(INDUSTRY_MAP_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"   ⚠ industry_map.json 读取失败，将重建: {e}")
+    return {}
+
+
+def save_industry_map(industry_map: dict[str, str]) -> None:
+    """把合并后的映射写回文件，供后续运行直接查表。"""
+    INDUSTRY_MAP_FILE.write_text(
+        json.dumps(industry_map, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
     """
-    一次 LLM 调用（智谱 BigModel，OpenAI 兼容接口），批量判断所有股票的行业。
-    对主流 A股/港股/美股 行业归属准确率较高；不确定时返回"其他"而非瞎猜。
+    先查持久化映射表，只对未命中的新股票调用 LLM 判断行业，
+    判完合并写回，后续运行直接查表（行业稳定、省 LLM 调用）。
     行业字段是 ERP 项目 popularity_signal.py 的输入，失败时行业列为空，
     下游人气信号会降级为「数据不足」。
     """
     api_key = os.environ.get("ZHIPU_API_KEY", "").strip()
-    if not api_key:
-        print("   ⚠ ZHIPU_API_KEY 未设置，跳过行业判断")
-        return
-    # 去重，避免重复查同一只股票
-    seen: dict[str, str] = {}  # symbol -> industry
-    unique = []
+    industry_map = load_industry_map()
+
+    # 收集缺行业的行：映射表里没有的、或之前判成"其他"的，才需要补判
+    pending = []
     for row in rows:
         sym = row["股票代码"]
-        if sym and sym not in seen:
-            seen[sym] = ""
-            unique.append({"symbol": sym, "name": row["股票名称"]})
+        if not sym:
+            continue
+        known = industry_map.get(sym, "")
+        if known and known != "其他":
+            row["行业"] = known          # 直接命中，不调 LLM
+        else:
+            pending.append({"symbol": sym, "name": row["股票名称"]})
+
+    if not pending:
+        print(f"   → 行业全部命中映射表（{len(rows)} 只），无需调 LLM")
+        return
+
+    if not api_key:
+        print("   ⚠ ZHIPU_API_KEY 未设置，新增股票行业留空")
+        return
+
+    # 去重（pending 内部），避免重复查同一只股票
+    seen: dict[str, str] = {}
+    unique = []
+    for s in pending:
+        if s["symbol"] not in seen:
+            seen[s["symbol"]] = ""
+            unique.append(s)
     if not unique:
         return
     stock_list = "\n".join(f'{s["symbol"]} {s["name"]}' for s in unique)
@@ -232,15 +270,19 @@ def enrich_industry_ai(rows: list[dict], debug: bool = False) -> None:
             print(f"\n[DEBUG] LLM 行业判断原始返回：\n{raw}\n")
         # 清理可能的 markdown 代码块
         raw = raw.replace("```json", "").replace("```", "").strip()
-        industry_map: dict[str, str] = json.loads(raw)
-        # 写回
-        for row in rows:
-            sym = row["股票代码"]
-            if sym in industry_map:
-                row["行业"] = industry_map[sym]
-        print(f"   → LLM 行业判断完成（{len(industry_map)} 只股票）")
+        new_map: dict[str, str] = json.loads(raw)
+
+        # 合并：新增的写回映射表，同时落到本行
+        for sym, ind in new_map.items():
+            industry_map[sym] = ind
+            for row in rows:
+                if row["股票代码"] == sym:
+                    row["行业"] = ind
+                    break
+        save_industry_map(industry_map)
+        print(f"   → 新增行业 {len(new_map)} 只，已写入 {INDUSTRY_MAP_FILE.name}")
     except Exception as e:
-        print(f"   ⚠ LLM 行业判断失败: {e}")
+        print(f"   ⚠ LLM 行业判断失败: {e}，已命中的仍保留映射表结果")
 
 # ─────────────────────────── 主流程 ───────────────────────────
 def scrape_and_save(debug: bool = False):
