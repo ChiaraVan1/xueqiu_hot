@@ -32,6 +32,7 @@ jobs:
           # 可选：保留作为 fallback；优先用 Playwright 自动获取
           XUEQIU_TOKEN: ${{ secrets.XUEQIU_TOKEN }}
           CLAUDE_API_KEY: ${{ secrets.CLAUDE_API_KEY }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: python xueqiu_scraper.py
 
       - name: Commit & Push CSV
