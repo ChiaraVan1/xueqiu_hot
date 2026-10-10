@@ -35,10 +35,15 @@ jobs:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: python xueqiu_scraper.py
 
-      - name: Commit & Push CSV
+      - name: Commit & Push 数据
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add xueqiu_data/
+          # industry_map.json 被 .gitignore 排除，但它是跨运行持久化的行业映射，
+          # 必须强制提交回仓库，否则下次运行读不到表、每天都全量重判。
+          if [ -f xueqiu_data/industry_map.json ]; then
+            git add -f xueqiu_data/industry_map.json
+          fi
           git diff --cached --quiet && echo "无新数据，跳过 commit" || \
             git commit -m "data: 热股榜 $(date -u +%Y-%m-%d)" && git push
