@@ -1,0 +1,10 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行产物：行业映射表（运行时自动生成，每次运行会更新，不入版本库）
+xueqiu_data/industry_map.json
+
+# 临时文件
+*.tmp
+.DS_Store
